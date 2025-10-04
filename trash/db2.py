@@ -13,16 +13,16 @@ class User:
         self.surname = surname
 
 class VehicleType(Enum):
-    TRAM = "TRAM"
-    BUS = "BUS"
-    TRAIN = "TRAIN"
-    OTHER = "OTHER"
+    TRAM = 0
+    BUS = 1
+    TRAIN = 2
+    OTHER = 3
 
 class DelayReason(Enum):
-    TRAFFIC_JAM = "TRAFFIC_JAM"
-    ROAD_ACCIDENT = "ROAD_ACCIDENT"
-    SEVERE_WEATHER = "SEVERE_WEATHER"
-    VEHICLE_ISSUE = "VEHICLE_ISSUE"
+    TRAFFIC_JAM = 0
+    ROAD_ACCIDENT = 1
+    SEVERE_WEATHER = 2
+    VEHICLE_ISSUE = 3
 
 
 class Vehicle:
@@ -49,9 +49,6 @@ class Stop:
     def __repr__(self):
         return f"Stop(uuid={self.uuid}, short_name={self.short_name}, long_name={self.long_name})"
 
-    def __lt__(self, other):
-        return self.uuid.int < other.uuid.int
-
 class Route:
     def __init__(self, uuid: UUID, line_number: int, destination: str, vehicles: List[Vehicle], stops: List[Stop]):
         self.uuid = uuid
@@ -61,42 +58,26 @@ class Route:
         self.stops = stops
 
 class Trip:
-    def __init__(self, uuid: UUID, route: Route, timestamps: List[datetime], ):
+    def __init__(self, uuid: UUID, route: Route, timestamps: List[datetime]):
         self.uuid = uuid
         self.route = route
         self.timestamps = timestamps #contains a list of timestamps with indices corresponding with stops on the route
 
 class Delay:
-    def __init__(self, uuid: UUID, time_delay: int, reason: str):
+    def __init__(self, uuid: UUID, time_delay: timedelta, reason: DelayReason):
         self.uuid = uuid
         self.time_delay = time_delay
         self.reason = reason
 
 class Database:
     def __init__(self, users: Dict[UUID, User],
-                 vehicles: Dict[UUID, Vehicle],
-                 stops: Dict[UUID, Stop],
                  trips: Dict[UUID, Trip],
-                 stop_delays: Dict[Tuple[Stop, Stop], int],
-                 vehicle_delays: Dict[Vehicle, int]):
+                 stop_delays: Dict[Tuple[Stop, Stop], Delay],
+                 vehicle_delays: Dict[Vehicle, Delay]):
         self.users = users
         self.trips = trips
         self.stop_delays = stop_delays
         self.vehicle_delays = vehicle_delays
-        self.vehicles = vehicles
-        self.stops = stops
-
-    def get_vehicle(self, uuid: UUID) -> Vehicle:
-        if uuid in self.vehicles:
-            return self.vehicles[uuid]
-        else:
-            return next(iter(self.vehicles.values()))
-
-    def get_stop(self, uuid: UUID) -> Stop:
-        if uuid in self.stops:
-            return self.stops[uuid]
-        else:
-            return next(iter(self.stops.values()))
 
 class Edge:
     def __init__(self, vehicle_uuid: UUID, trip_uuid: UUID, next_stop: Stop, start_timestamp: datetime, time: int):
@@ -105,17 +86,6 @@ class Edge:
         self.next_stop = next_stop
         self.start_timestamp = start_timestamp
         self.time = time  # in seconds
-
-from db_setup import db
-
-def report_delay(vehicle: Vehicle, delay: Delay, current_position: Tuple[Stop, Stop]):
-    if delay.reason == "VEHICLE_ISSUE":
-        #theres an issue with the vehicle, road remains unaffected
-        db.vehicle_delays[vehicle] = delay
-    else:
-        #delay is most likely caused by the particular route between given stops
-        db.stop_delays[current_position] = delay
-
 
 def get_routes(database: Database, stop: Stop, timestamp: datetime) -> List[Edge]:
     edges: List[Edge] = []
@@ -178,3 +148,6 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def find_nearest_stop(lat: float, lon: float, stops: List[Stop]) -> Stop:
     nearest = min(stops, key=lambda stop: haversine(lat, lon, stop.latitude, stop.longitude))
     return nearest
+
+#if __name__ == "__main__":
+

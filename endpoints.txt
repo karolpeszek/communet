@@ -1,0 +1,109 @@
+POST /api/v1/delay/report
+{
+    "vehicle_uuid": "7a7eb004-794d-4f68-b79c-c6ad3042f9d0", //current vehicle of the user
+    "current_stop_uuid": "33d92c11-966a-48b8-9e0d-6d038ec3905b", //current or past stop
+    "next_stop_uuid": "0f1835a0-846d-4eae-983e-fbd9548130e0" //next stop
+    "delay_reason": "TRAFFIC_JAM" //available reasons: TRAFFIC_JAM, ROAD_ACCIDENT, SEVERE_WEATHER, VEHICLE_ISSUE
+}
+
+
+GET /api/v1/vehicle/<vehicle uuid>/getinfo
+//return serialized json data containing these fields:
+- uuid
+- license plate number
+- type (string with possible options: TRAM, BUS, TRAIN)
+- owner (operator, eg. "MPK Krakow")
+
+
+GET /api/v1/stop/<stop uuid>/getinfo
+//return serialized json data containing these fields:
+- uuid
+- longitude and latitude
+- short_name (like "Czerwone Maki")
+- long_name (like "Czerone Maki P+R 3t")
+- zone_id (like "KRAKOW_STREFA_1")
+- type (corresponds to the vehicle type, possible values are TRAM, BUS, TRAIN)
+
+
+GET /api/v1/route/<route uuid>/getinfo
+//return serialized json data containing these fields:
+-uuid
+-line number (as string) (eg. "192" or "A8" or "SKA1")
+-destination (eg "Wieliczka Miasto")
+-vehicles (list of uuids of the vehicles operating on a particular route)
+-stops (list of uuids of the stops in order on current route)
+
+GET /api/v1/route/<route uuid>/getshape
+{
+    "uuid": "", //uuid of the route
+    "shape": [
+        //fine grained list of pairs of coordinates to draw the map on the screen
+        { "latitude": 1234, "longitute": 1234 },
+
+
+
+    ]
+}
+
+GET /api/v1/trip/<trip uuid>/getinfo
+//return serialized json data containng these felds
+-uuid
+-route_uuid - the route that trip operates on
+-timestamps (list of timestamps matching in length with the list of stops in current route)
+//timestamps should be unix milisecond timestamps
+
+GET /api/v1/user/<uuid of the user>/current_trip
+{
+    "trip_uuid": "" //uuid of the current trip
+    "current_position": {
+        "current_stop_uuid": "",
+        "next_stop_uuid": "",
+    }
+}
+
+
+POST /api/v1/planning/getroutes
+data input:
+{
+    "start": {
+        "latitude": 1234,
+        "longitude": 5678
+    },
+    "destination": {
+        "latitude": 2137,
+        "longitude": 69420
+    },
+    "journey_start_timestamp": (unix timestamp ms)
+}
+
+returns:
+[
+    //list of available journeys:
+    {
+        //data for one jurney
+        "start_stop_uuid": "", //uuid of the starting stop
+        "destination_stop_uuid": "", //uuid of the destination stop
+        "journey_start_timestamp": "", //timestamp of the beginning of the journey
+        "journey_duration": 2137, // journey duration in minutes
+        connections: [
+            //following connections
+            {
+                "trip_uuid": "" //uuid of the particular trip
+                "start_stop_uuid": //uuid of the beginning stop
+                "stop_stop_uuid": //uuid of the destionation stop for that connection
+                "vehicle_uuid": //uuid of the handling vehicle
+
+            }
+        ]
+
+
+
+    }
+
+
+
+]
+
+//to do:
+- endpointy do enumeracji identyfikatorów poszczególnych encji
+- endpoint do zaplanowania trasy

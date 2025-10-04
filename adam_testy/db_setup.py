@@ -1,0 +1,770 @@
+# db_setup.py
+import csv
+import io
+import ssl
+import uuid
+import zipfile
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Tuple, Optional
+from urllib.request import urlopen
+
+from db import *  # Stop, Vehicle, Trip, Route, Database, VehicleType
+
+# Adresy oficjalnych statycznych plików GTFS (ZTP Kraków)
+GTFS_BASE = "https://gtfs.ztp.krakow.pl"
+# Zbiór plików – w praktyce wystarczą T (tramwaje) i A/M (autobusy)
+GTFS_FILES = ["GTFS_KRK_T.zip", "GTFS_KRK_A.zip", "GTFS_KRK_M.zip"]
+
+# Linie, które chcesz mieć w bazie (rozszerzona lista głównych linii Krakowa)
+TARGET_LINES = {
+    # Tramwaje
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "17", "18", "19", "20", "21", "22",
+    "24", "50", "52",
+    # Autobusy - główne linie
+    "104", "114", "124", "128", "129", "130", "139", "144", "152", "159", "164", "173", "178", "179", "194",
+    "208", "209", "210", "258", "304", "424", "502", "503", "578"
+}
+
+
+def _download(url: str) -> bytes:
+    """Pobiera plik z sieci."""
+    print(f"Próba pobrania: {url}")
+    try:
+        # Tworzymy kontekst SSL, który ignoruje problemy z certyfikatem
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
+        with urlopen(url, context=ssl_context) as r:
+            data = r.read()
+            print(f"Pobrano {len(data)} bajtów z {url}")
+            return data
+    except Exception as e:
+        print(f"Błąd podczas pobierania {url}: {e}")
+        return b""
+
+
+def _zip_has(zb: bytes, name: str) -> bool:
+    with zipfile.ZipFile(io.BytesIO(zb)) as z:
+        return any(i.filename.endswith(name) for i in z.infolist())
+
+
+def _open_from_zip(zb: bytes, name: str):
+    z = zipfile.ZipFile(io.BytesIO(zb))
+    # znajdź dokładną ścieżkę do pliku (czasem bywa prefiks katalogu)
+    for i in z.infolist():
+        if i.filename.endswith(name):
+            return z, z.open(i.filename)
+    return z, None
+
+
+def _read_csv_from_zip(zdata: bytes, name: str) -> List[Dict[str, str]]:
+    """
+    Czyta plik CSV z archiwum ZIP, usuwa BOM, normalizuje nagłówki (lower + trim).
+    Zwraca listę słowników z kluczami w lower-case.
+    """
+    z, fh = _open_from_zip(zdata, name)
+    if fh is None:
+        z.close()
+        return []
+
+    try:
+        reader = csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8-sig"))
+        rows: List[Dict[str, str]] = []
+        for row in reader:
+            norm = {}
+            for k, v in (row or {}).items():
+                if k is None:
+                    continue
+                nk = k.strip().lstrip("\ufeff").lower()
+                nv = v.strip() if isinstance(v, str) else v
+                norm[nk] = nv
+            if any(val not in (None, "", []) for val in norm.values()):
+                rows.append(norm)
+        return rows
+    finally:
+        fh.close()
+        z.close()
+
+
+def _parse_gtfs_date(yyyymmdd: str) -> date:
+    return date(int(yyyymmdd[0:4]), int(yyyymmdd[4:6]), int(yyyymmdd[6:8]))
+
+
+def _time_to_datetime(day: date, hhmmss: str) -> datetime:
+    """Konwertuje czas GTFS (może przekraczać 24h) na datetime."""
+    h, m, s = [int(x) for x in hhmmss.split(":")]
+    extra_days, h = divmod(h, 24)
+    base = datetime.combine(day, datetime.min.time())
+    return base + timedelta(days=extra_days, hours=h, minutes=m, seconds=s)
+
+
+def _service_ids_for_day(calendar_rows, calendar_dates_rows, target_day: date) -> set:
+    """
+    Wyznacza zestaw service_id aktywnych w danym dniu na podstawie calendar.txt i calendar_dates.txt.
+    Odporne na BOM, brakujące kolumny oraz brak któregokolwiek z plików.
+    """
+    weekday_map = {
+        0: "monday", 1: "tuesday", 2: "wednesday",
+        3: "thursday", 4: "friday", 5: "saturday", 6: "sunday"
+    }
+    wkey = weekday_map[target_day.weekday()]
+    active = set()
+
+    # calendar.txt
+    for row in calendar_rows or []:
+        sid = row.get("service_id")
+        if not sid:
+            continue
+        try:
+            start = _parse_gtfs_date(row["start_date"])
+            end = _parse_gtfs_date(row["end_date"])
+        except KeyError:
+            # brak wymaganych pól – pomijamy
+            continue
+        if start <= target_day <= end and row.get(wkey) == "1":
+            active.add(sid)
+
+    # calendar_dates.txt
+    for row in calendar_dates_rows or []:
+        sid = row.get("service_id")
+        d_str = row.get("date")
+        if not sid or not d_str:
+            continue
+        d = _parse_gtfs_date(d_str)
+        if d != target_day:
+            continue
+        et = row.get("exception_type")
+        if et == "1":
+            active.add(sid)
+        elif et == "2":
+            active.discard(sid)
+
+    return active
+
+
+def _safe_line_number(route_short_name: str) -> Optional[int]:
+    """Konwertuje route_short_name na int (dla alfanumerycznych zwraca None)."""
+    try:
+        return int(route_short_name)
+    except Exception:
+        return None
+
+
+def create_krakow_database(target_day: Optional[date] = None) -> Database:
+    """
+    Tworzy i zwraca obiekt bazy danych z prawdziwymi danymi GTFS dla linii: 1, 18, 52, 128, 178, 578.
+    Parametry:
+      - target_day: data, dla której generujemy rozkład (domyślnie: dzisiejsza).
+    Uwaga: statyczny GTFS nie zawiera realnych identyfikatorów pojazdów, więc `vehicles` będzie puste.
+           Jeśli chcesz mieć pojazdy/opóźnienia, dołóż krok GTFS-Realtime.
+    """
+    if target_day is None:
+        target_day = datetime.now().date()
+
+    # 1) Pobierz i wczytaj GTFS (T + A + M)
+    print(f"Pobieranie danych GTFS dla daty: {target_day}")
+    feeds: List[Tuple[str, bytes]] = []
+    for fname in GTFS_FILES:
+        try:
+            zbytes = _download(f"{GTFS_BASE}/{fname}")
+            if zbytes:  # tylko jeśli pobrano dane
+                feeds.append((fname, zbytes))
+                print(f"Pomyślnie pobrano {fname}")
+            else:
+                print(f"Nie udało się pobrać {fname}")
+        except Exception as e:
+            print(f"Błąd przy pobieraniu {fname}: {e}")
+            continue
+
+    print(f"Pobrano {len(feeds)} plików GTFS z {len(GTFS_FILES)} dostępnych")
+
+    # Przygotuj struktury agregujące
+    # Uwaga: dla prostoty nie deduplikujemy przystanków między pakietami ZIP
+    # (nie jest to potrzebne, bo tripy odwołują się do stop_id w ramach tego samego ZIP).
+    stops_used_set = set()  # zbiór UUID użytych przystanków
+    all_stops_by_key: Dict[Tuple[str, str], Stop] = {}  # (feed, stop_id) -> Stop
+    routes_cache: Dict[Tuple[str, str, str, Tuple[uuid.UUID, ...]], Route] = {}
+    all_trips: List[Trip] = []
+
+    # Tworzymy zmyślone pojazdy dla każdego typu transportu
+    tram_vehicles = []
+    bus_vehicles = []
+
+    # Generujemy pojazdy tramwajowe
+    for i in range(20):
+        vehicle = Vehicle(
+            uuid=uuid.uuid4(),
+            license_plate=f"KR-T{i + 1:03d}",
+            type=VehicleType.TRAM,
+            capacity=180 + (i % 3) * 20,  # różne pojemności: 180, 200, 220
+            owner="MPK Kraków"
+        )
+        tram_vehicles.append(vehicle)
+
+    # Generujemy pojazdy autobusowe
+    for i in range(30):
+        vehicle = Vehicle(
+            uuid=uuid.uuid4(),
+            license_plate=f"KR-A{i + 1:03d}",
+            type=VehicleType.BUS,
+            capacity=90 + (i % 4) * 15,  # różne pojemności: 90, 105, 120, 135
+            owner="MPK Kraków"
+        )
+        bus_vehicles.append(vehicle)
+
+    all_vehicles = tram_vehicles + bus_vehicles
+    print(f"Utworzono {len(tram_vehicles)} tramwajów i {len(bus_vehicles)} autobusów")
+
+    for fname, zbytes in feeds:
+        print(f"\nPrzetwarzanie pliku: {fname}")
+        # Wczytaj pliki (klucze już w lower-case)
+        stops = _read_csv_from_zip(zbytes, "stops.txt")
+        routes = _read_csv_from_zip(zbytes, "routes.txt")
+        trips = _read_csv_from_zip(zbytes, "trips.txt")
+        stop_times = _read_csv_from_zip(zbytes, "stop_times.txt")
+        calendar = _read_csv_from_zip(zbytes, "calendar.txt") if _zip_has(zbytes, "calendar.txt") else []
+        calendar_dates = _read_csv_from_zip(zbytes, "calendar_dates.txt") if _zip_has(zbytes,
+                                                                                      "calendar_dates.txt") else []
+
+        print(
+            f"  Wczytano: {len(stops)} przystanków, {len(routes)} tras, {len(trips)} kursów, {len(stop_times)} czasów przystanków")
+        print(f"  Kalendarze: {len(calendar)} regularnych, {len(calendar_dates)} wyjątków")
+
+        # Mapy pomocnicze
+        routes_by_id = {r.get("route_id"): r for r in routes if r.get("route_id")}
+        stops_by_id = {s.get("stop_id"): s for s in stops if s.get("stop_id")}
+
+        active_service_ids = _service_ids_for_day(calendar, calendar_dates, target_day)
+        print(
+            f"  Aktywne service_ids dla {target_day}: {len(active_service_ids)} ({list(active_service_ids)[:5]}{'...' if len(active_service_ids) > 5 else ''})")
+
+        # Wybierz route_id dla interesujących linii
+        wanted_route_ids = set()
+        all_route_lines = set()  # Dla diagnostyki - wszystkie dostępne linie
+        route_types_found = {}  # Diagnostyka typów tras
+        for r in routes:
+            short = (r.get("route_short_name") or "").strip()
+            route_type = r.get("route_type", "3")
+            all_route_lines.add(short)
+
+            # Zapisz typ trasy dla diagnostyki
+            if short not in route_types_found:
+                route_types_found[short] = route_type
+
+            if short in TARGET_LINES:
+                rid = r.get("route_id")
+                if rid:
+                    wanted_route_ids.add(rid)
+
+        print(
+            f"  Wszystkie dostępne linie w tym pliku: {sorted(all_route_lines)} (łącznie: {len(all_route_lines)})")
+        print(f"  Wybrane linie z TARGET_LINES: {[line for line in sorted(all_route_lines) if line in TARGET_LINES]}")
+
+        # Pokaż typy tras dla wybranych linii
+        selected_types = {line: route_types_found.get(line, "unknown") for line in TARGET_LINES if
+                          line in route_types_found}
+        print(f"  Typy tras (route_type): {selected_types}")
+        tram_lines = [line for line, rtype in selected_types.items() if rtype == "0"]
+        bus_lines = [line for line, rtype in selected_types.items() if rtype in ["3", "1"]]
+        print(f"  Tramwaje (route_type=0): {tram_lines}")
+        print(f"  Autobusy (route_type=3/1): {bus_lines}")
+
+        if not wanted_route_ids:
+            print(f"  Nie znaleziono żądanych linii {TARGET_LINES} w tym pliku")
+            continue
+        else:
+            print(f"  Znaleziono {len(wanted_route_ids)} żądanych tras: {wanted_route_ids}")
+
+        # Zbuduj Stop obiekty (raz na ZIP)
+        for sid, s in stops_by_id.items():
+            try:
+                lat = float(s["stop_lat"])
+                lon = float(s["stop_lon"])
+            except Exception:
+                # pomiń uszkodzone wiersze
+                continue
+            name = (s.get("stop_name") or "").strip()
+            zone = (s.get("zone_id") or "I").strip() or "I"
+            st_obj = Stop(
+                uuid=uuid.uuid4(),
+                latitude=lat,
+                longitude=lon,
+                short_name=name,
+                long_name=name,
+                zone_id=zone,
+                # typ ustawimy niżej na podstawie route_type pierwszego tripa, który użyje tego stopu
+                type=VehicleType.TRAM
+            )
+            all_stops_by_key[(fname, sid)] = st_obj
+
+        # Tripy z filtrem po dacie i liniach
+        trips_filtered = []
+        for tr in trips:
+            rid = tr.get("route_id")
+            if rid not in wanted_route_ids:
+                continue
+            sid = tr.get("service_id")
+            # jeśli mamy aktywny zestaw, filtruj; jeśli pusty (brak kalendarza), przepuść wszystko
+            if active_service_ids and sid not in active_service_ids:
+                continue
+            trips_filtered.append(tr)
+
+        if not trips_filtered:
+            print(f"  Brak aktywnych kursów dla daty {target_day}")
+            continue
+        else:
+            print(f"  Przefiltrowano do {len(trips_filtered)} aktywnych kursów")
+
+        # Stop_times mapowanie: trip_id -> list[rows]
+        st_by_trip = defaultdict(list)
+        for st in stop_times:
+            tid = st.get("trip_id")
+            if tid:
+                st_by_trip[tid].append(st)
+
+        # Budowa Route/Trip
+        for tr in trips_filtered:
+            local_trip_id = tr.get("trip_id")
+            if not local_trip_id:
+                continue
+
+            times = st_by_trip.get(local_trip_id, [])
+            if not times:
+                continue
+
+            # sortowanie po kolejności przystanków
+            try:
+                times_sorted = sorted(times, key=lambda r: int(r.get("stop_sequence") or "0"))
+            except Exception:
+                # jeśli wystąpi błąd konwersji, pomiń ten trip
+                continue
+
+            # Odczyt meta route’u
+            r_meta = routes_by_id.get(tr.get("route_id") or "")
+            if not r_meta:
+                continue
+
+            short_name = (r_meta.get("route_short_name") or "").strip()
+            line_number_int = _safe_line_number(short_name)
+            headsign_hint = (r_meta.get("route_long_name") or short_name or "").strip()
+            try:
+                route_type_val = int((r_meta.get("route_type") or "3").strip())
+            except Exception:
+                route_type_val = 3  # bus jako domyślne
+
+            vtype_from_route = VehicleType.TRAM if route_type_val == 0 else VehicleType.BUS
+
+            # Określ typ pojazdu na podstawie nazwy pliku ZIP
+            if "GTFS_KRK_T.zip" in fname:
+                vtype = VehicleType.TRAM  # Plik tramwajowy
+            elif "GTFS_KRK_A.zip" in fname or "GTFS_KRK_M.zip" in fname:
+                vtype = VehicleType.BUS  # Pliki autobusowe
+            else:
+                vtype = vtype_from_route  # Fallback do route_type
+
+            # Debug: sprawdź typ trasy
+            if len(all_trips) < 5:  # Pokaż tylko dla pierwszych kilku tras
+                print(
+                    f"    DEBUG: Plik {fname}, Linia {short_name}, route_type={route_type_val}, vtype_final={vtype.name}")
+
+            # Sekwencja przystanków (obiekty Stop) dla tego tripa
+            stop_objs: List[Stop] = []
+            for r in times_sorted:
+                sid = r.get("stop_id")
+                st_obj = all_stops_by_key.get((fname, sid))
+                if st_obj is None:
+                    continue
+                # ustaw typ przystanku na podstawie tego route_type (pierwsze przypisanie wygrywa)
+                if st_obj.type not in (VehicleType.TRAM, VehicleType.BUS):
+                    st_obj.type = vtype
+                else:
+                    # jeśli przystanek jeszcze ma domyślny TRAM a trasa jest BUS (albo odwrotnie),
+                    # możesz zmienić logikę. Zostawiamy pierwsze przypisanie.
+                    pass
+                stop_objs.append(st_obj)
+
+            if len(stop_objs) < 2:
+                # zbyt krótka trasa
+                continue
+
+            direction_id = (tr.get("direction_id") or "").strip()
+            headsign = (tr.get("trip_headsign") or "").strip() or headsign_hint
+            route_key = (fname, tr.get("route_id") or "", direction_id, tuple(s.uuid for s in stop_objs))
+
+            if route_key not in routes_cache:
+                # jeśli line_number_int jest None (np. dla linii alfanumerycznych), ustaw -1
+                ln = line_number_int if line_number_int is not None else -1
+
+                # Przypisz pojazd na podstawie typu trasy
+                if vtype == VehicleType.TRAM:
+                    assigned_vehicles = [tram_vehicles[len(routes_cache) % len(tram_vehicles)]]
+                    vehicle_type_assigned = "TRAM"
+                else:
+                    assigned_vehicles = [bus_vehicles[len(routes_cache) % len(bus_vehicles)]]
+                    vehicle_type_assigned = "BUS"
+
+                # Debug: sprawdź przypisanie pojazdu
+                if len(routes_cache) < 5:  # Pokaż tylko dla pierwszych kilku tras
+                    print(
+                        f"    DEBUG: Przypisano pojazd {assigned_vehicles[0].license_plate} ({vehicle_type_assigned}) do linii {ln}")
+
+                routes_cache[route_key] = Route(
+                    uuid=uuid.uuid4(),
+                    line_number=ln,
+                    destination=headsign,
+                    vehicles=assigned_vehicles,
+                    stops=stop_objs
+                )
+            route_obj = routes_cache[route_key]
+
+            # Czasy – użyj arrival_time, a gdy brak to departure_time
+            timestamps: List[datetime] = []
+            for r in times_sorted:
+                t = (r.get("arrival_time") or r.get("departure_time") or "").strip()
+                if not t:
+                    continue
+                try:
+                    ts = _time_to_datetime(target_day, t)
+                    timestamps.append(ts)
+                except Exception:
+                    continue
+
+            if not timestamps:
+                continue
+
+            trip_obj = Trip(uuid=uuid.uuid4(), route=route_obj, timestamps=timestamps)
+            all_trips.append(trip_obj)
+            # oznacz użyte przystanki
+            for s in stop_objs:
+                stops_used_set.add(s.uuid)
+
+    # 2) Złożenie finalnej bazy
+    trips_dict = {t.uuid: t for t in all_trips}
+    # Dodajemy zmyślone pojazdy do bazy danych
+    vehicles_dict: Dict[uuid.UUID, Vehicle] = {v.uuid: v for v in all_vehicles}
+
+    # Zbierz tylko użyte przystanki
+    used_stops = [st for st in all_stops_by_key.values() if st.uuid in stops_used_set]
+    stops_dict = {s.uuid: s for s in used_stops}
+
+    print(f"\nPodsumowanie:")
+    print(f"Utworzono {len(all_trips)} kursów")
+    print(f"Użyto {len(used_stops)} przystanków")
+    print(f"Utworzono {len(routes_cache)} tras")
+    print(f"Dodano {len(vehicles_dict)} pojazdów")
+
+    return Database(
+        users={},
+        vehicles=vehicles_dict,
+        stops=stops_dict,
+        trips=trips_dict,
+        stop_delays={},
+        vehicle_delays={}
+    )
+
+
+db = create_krakow_database()  # za usunięcie tej linijki grozi kara śmierci przez rozjechanie tramwajem
+
+
+
+# import uuid
+# import random
+# from datetime import timedelta
+#
+# from db import *
+#
+#
+# def create_krakow_database() -> Database:
+#     """
+#     Tworzy i zwraca obiekt bazy danych z danymi dla wybranych linii w Krakowie.
+#     """
+#
+#     # --- 1. Definicje przystanków dla poszczególnych linii ---
+#     # Używamy list stringów, aby uniknąć duplikowania obiektów Stop
+#     stops_data = {
+#         # Tramwaje
+#         "1_Wzgorza_Krzeslawickie": ["Salwator", "Plac Na Stawach", "Jubilat", "Filharmonia", "Plac Wszystkich Świętych",
+#                                     "Poczta Główna", "Rondo Grzegórzeckie", "Rondo Mogilskie", "Cystersów", "Białucha",
+#                                     "Wieczysta", "Rondo Czyżyńskie", "Czyżyny Dworzec", "Plac Centralny im. R. Reagana",
+#                                     "Struga", "Wzgórza Krzesławickie"],
+#         "18_Krowodrza_Gorka": ["Czerwone Maki P+R", "Chmieleniec", "Kampus UJ", "Norymberska", "Grota-Roweckiego",
+#                                "Rondo Grunwaldzkie", "Wawel", "Plac Wszystkich Świętych", "Teatr Bagatela", "Batorego",
+#                                "Plac Inwalidów", "Urząd Marszałkowski", "Biprostal", "Krowodrza Górka"],
+#         "52_Czerwone_Maki": ["Os. Piastów", "Piasta Kołodzieja", "Kleeberga", "Rondo Piastowskie", "Rondo Hipokratesa",
+#                              "DH Wanda", "Rondo Czyżyńskie", "AWF", "Rondo Mogilskie", "Dworzec Główny Tunel",
+#                              "Teatr Słowackiego", "Stary Kleparz", "Teatr Bagatela", "Uniwersytet Jagielloński",
+#                              "Rondo Grunwaldzkie", "Grota-Roweckiego", "Norymberska", "Kampus UJ", "Chmieleniec",
+#                              "Czerwone Maki P+R"],
+#         # Autobusy
+#         "128_Zajezdnia_Plaszow": ["Zajezdnia Płaszów", "Stoczniowców", "Dworcowa", "Rondo Grzegórzeckie",
+#                                   "Rondo Mogilskie", "Lubicz", "Dworzec Główny Wschód"],
+#         "178_Podgorze_SKA": ["Mistrzejowice", "Rondo Piastowskie", "Bohomolca", "Os. Strusia", "Os. Złotego Wieku",
+#                              "Aleja Róż", "Plac Centralny im. R. Reagana", "Struga", "Rondo Czyżyńskie", "Nowohucka",
+#                              "Lipska", "Kuklińskiego", "Podgórze SKA"],
+#         "578_Mistrzejowice": ["Dworzec Główny Wschód", "Rondo Mogilskie", "AWF", "Rondo Czyżyńskie",
+#                               "Stella-Sawickiego", "Wiślicka", "Os. Kościuszkowskie", "Mistrzejowice"]
+#     }
+#
+#     # Każda linia ma trasę powrotną (lista przystanków w odwrotnej kolejności)
+#     stops_data["1_Salwator"] = stops_data["1_Wzgorza_Krzeslawickie"][::-1]
+#     stops_data["18_Czerwone_Maki"] = stops_data["18_Krowodrza_Gorka"][::-1]
+#     stops_data["52_Os_Piastow"] = stops_data["52_Czerwone_Maki"][::-1]
+#     stops_data["128_Dworzec_Glowny"] = stops_data["128_Zajezdnia_Plaszow"][::-1]
+#     stops_data["178_Mistrzejowice"] = stops_data["178_Podgorze_SKA"][::-1]
+#     stops_data["578_Dworzec_Glowny"] = stops_data["578_Mistrzejowice"][::-1]
+#
+#     # --- 2. Tworzenie unikalnych obiektów Stop ---
+#     # Słownik przechowujący obiekty Stop, aby uniknąć duplikatów
+#     all_stops: Dict[str, Stop] = {}
+#
+#     # Przykładowe, przybliżone współrzędne dla niektórych przystanków
+#     # W pełnej implementacji te dane pochodziłyby z API lub bazy danych
+#     coords = {
+#         "Salwator": (50.054, 19.915), "Jubilat": (50.057, 19.927), "Filharmonia": (50.059, 19.932),
+#         "Poczta Główna": (50.059, 19.943), "Rondo Grzegórzeckie": (50.060, 19.957), "Rondo Mogilskie": (50.068, 19.960),
+#         "Wieczysta": (50.076, 19.982), "Rondo Czyżyńskie": (50.072, 20.005),
+#         "Plac Centralny im. R. Reagana": (50.070, 20.038),
+#         "Wzgórza Krzesławickie": (50.093, 20.069), "Czerwone Maki P+R": (50.016, 19.907), "Kampus UJ": (50.026, 19.912),
+#         "Rondo Grunwaldzkie": (50.048, 19.936), "Teatr Bagatela": (50.064, 19.933), "Krowodrza Górka": (50.082, 19.923),
+#         "Os. Piastów": (50.103, 20.012), "Dworzec Główny Tunel": (50.066, 19.947),
+#         "Zajezdnia Płaszów": (50.036, 19.992),
+#         "Podgórze SKA": (50.039, 19.965), "Mistrzejowice": (50.098, 20.000)
+#     }
+#
+#     # Pętla tworząca obiekty Stop
+#     for stop_list in stops_data.values():
+#         for stop_name in stop_list:
+#             if stop_name not in all_stops:
+#                 lat, lon = coords.get(stop_name, (50.06, 19.94))  # Domyślne koordynaty, jeśli brak
+#                 all_stops[stop_name] = Stop(
+#                     uuid=uuid.uuid4(),
+#                     latitude=lat,
+#                     longitude=lon,
+#                     short_name=stop_name,
+#                     long_name=stop_name,
+#                     zone_id="I",  # Założenie, że wszystkie są w I strefie biletowej
+#                     type=VehicleType.TRAM  # Domyślnie, zostanie to dostosowane później
+#                 )
+#
+#     # --- 3. Tworzenie pojazdów ---
+#     vehicles = [
+#         # Tramwaje
+#         Vehicle(uuid.uuid4(), "#RZ101", VehicleType.TRAM, 180, "MPK Kraków"),
+#         Vehicle(uuid.uuid4(), "#RZ102", VehicleType.TRAM, 180, "MPK Kraków"),
+#         Vehicle(uuid.uuid4(), "#RZ201", VehicleType.TRAM, 220, "MPK Kraków"),
+#         Vehicle(uuid.uuid4(), "#RZ202", VehicleType.TRAM, 220, "MPK Kraków"),
+#         Vehicle(uuid.uuid4(), "#RZ301", VehicleType.TRAM, 200, "MPK Kraków"),
+#         Vehicle(uuid.uuid4(), "#RZ302", VehicleType.TRAM, 200, "MPK Kraków"),
+#         # Autobusy
+#         Vehicle(uuid.uuid4(), "KR 128AB", VehicleType.BUS, 90, "MPK Kraków"),
+#         Vehicle(uuid.uuid4(), "KR 178BC", VehicleType.BUS, 120, "MPK Kraków"),
+#         Vehicle(uuid.uuid4(), "KR 578CD", VehicleType.BUS, 90, "MPK Kraków"),
+#     ]
+#
+#     tram_vehicles = [v for v in vehicles if v.type == VehicleType.TRAM]
+#     bus_vehicles = [v for v in vehicles if v.type == VehicleType.BUS]
+#
+#     # --- 4. Generowanie tras i przejazdów (Trips) ---
+#     all_trips: List[Trip] = []
+#
+#     def generate_trips_for_route(
+#             line_number: int,
+#             destination_name: str,
+#             vehicle_list: List[Vehicle],
+#             stop_names: List[str],
+#             start_hour: int,
+#             end_hour: int,
+#             frequency_minutes: int,
+#             time_between_stops_sec: int
+#     ):
+#         # Pobierz pełne obiekty Stop dla danej trasy
+#         route_stops = [all_stops[name] for name in stop_names]
+#
+#         # Stwórz obiekt trasy (Route)
+#         route = Route(
+#             uuid=uuid.uuid4(),
+#             line_number=line_number,
+#             destination=destination_name,
+#             vehicles=[vehicle_list[line_number % len(vehicle_list)]],  # Przypisz pojazd do trasy
+#             stops=route_stops
+#         )
+#
+#         # Pętla generująca przejazdy (Trips) na dany dzień
+#         today = datetime.now().date()
+#         current_time = datetime.combine(today, datetime.min.time()).replace(hour=start_hour)
+#         end_time = datetime.combine(today, datetime.min.time()).replace(hour=end_hour)
+#
+#         while current_time < end_time:
+#             timestamps = []
+#             stop_time = current_time
+#             for _ in route.stops:
+#                 timestamps.append(stop_time)
+#                 stop_time += timedelta(seconds=time_between_stops_sec)
+#
+#             trip = Trip(uuid=uuid.uuid4(), route=route, timestamps=timestamps)
+#             all_trips.append(trip)
+#
+#             current_time += timedelta(minutes=frequency_minutes)
+#
+#     # Definicje parametrów dla każdej linii
+#     route_definitions = [
+#         {"line": 1, "dest": "Wzgorza_Krzeslawickie", "vehicles": tram_vehicles, "start": 5, "end": 23, "freq": 15,
+#          "time_per_stop": 150},
+#         {"line": 1, "dest": "Salwator", "vehicles": tram_vehicles, "start": 5, "end": 23, "freq": 15,
+#          "time_per_stop": 150},
+#         {"line": 18, "dest": "Krowodrza_Gorka", "vehicles": tram_vehicles, "start": 5, "end": 23, "freq": 15,
+#          "time_per_stop": 130},
+#         {"line": 18, "dest": "Czerwone_Maki", "vehicles": tram_vehicles, "start": 5, "end": 23, "freq": 15,
+#          "time_per_stop": 130},
+#         {"line": 52, "dest": "Czerwone_Maki", "vehicles": tram_vehicles, "start": 5, "end": 23, "freq": 10,
+#          "time_per_stop": 120},
+#         {"line": 52, "dest": "Os_Piastow", "vehicles": tram_vehicles, "start": 5, "end": 23, "freq": 10,
+#          "time_per_stop": 120},
+#         {"line": 128, "dest": "Zajezdnia_Plaszow", "vehicles": bus_vehicles, "start": 6, "end": 22, "freq": 30,
+#          "time_per_stop": 180},
+#         {"line": 128, "dest": "Dworzec_Glowny", "vehicles": bus_vehicles, "start": 6, "end": 22, "freq": 30,
+#          "time_per_stop": 180},
+#         {"line": 178, "dest": "Podgorze_SKA", "vehicles": bus_vehicles, "start": 5, "end": 22, "freq": 20,
+#          "time_per_stop": 160},
+#         {"line": 178, "dest": "Mistrzejowice", "vehicles": bus_vehicles, "start": 5, "end": 22, "freq": 20,
+#          "time_per_stop": 160},
+#         {"line": 578, "dest": "Mistrzejowice", "vehicles": bus_vehicles, "start": 6, "end": 20, "freq": 40,
+#          "time_per_stop": 150},
+#         {"line": 578, "dest": "Dworzec_Glowny", "vehicles": bus_vehicles, "start": 6, "end": 20, "freq": 40,
+#          "time_per_stop": 150},
+#     ]
+#
+#     for definition in route_definitions:
+#         route_key = f"{definition['line']}_{definition['dest']}"
+#         generate_trips_for_route(
+#             line_number=definition["line"],
+#             destination_name=definition["dest"].replace("_", " "),
+#             vehicle_list=definition["vehicles"],
+#             stop_names=stops_data[route_key],
+#             start_hour=definition["start"],
+#             end_hour=definition["end"],
+#             frequency_minutes=definition["freq"],
+#             time_between_stops_sec=definition["time_per_stop"]
+#         )
+#
+#     # --- 5. Dodawanie losowych opóźnień ---
+#     def add_random_delays(database_instance: Database):
+#         """
+#         Dodaje losowe opóźnienia dla wybranych pojazdów i odcinków tras.
+#         """
+#
+#         # Lista możliwych przyczyn opóźnień
+#         delay_reasons = [
+#             DelayReason.TRAFFIC_JAM,
+#             DelayReason.ROAD_ACCIDENT,
+#             DelayReason.SEVERE_WEATHER,
+#             DelayReason.VEHICLE_ISSUE
+#         ]
+#
+#         # Dodaj opóźnienia pojazdów (30% szans na opóźnienie dla każdego pojazdu)
+#         for vehicle in vehicles:
+#             if random.random() < 0.3:  # 30% szans
+#                 delay_minutes = random.randint(2, 12)  # 2-12 minut opóźnienia
+#                 reason = random.choice(delay_reasons)
+#
+#                 delay = Delay(
+#                     uuid=uuid.uuid4(),
+#                     time_delay=timedelta(minutes=delay_minutes),
+#                     reason=reason
+#                 )
+#
+#                 database_instance.vehicle_delays[vehicle] = delay
+#                 print(f"🚊 Pojazd {vehicle.license_plate} ma opóźnienie {delay_minutes} min (przyczyna: {reason.name})")
+#
+#         # Dodaj opóźnienia na odcinkach tras (15% szans dla każdego odcinka)
+#         processed_pairs = set()  # Aby uniknąć duplikatów
+#
+#         for trip in all_trips:
+#             route_stops = trip.route.stops
+#
+#             for i in range(len(route_stops) - 1):
+#                 current_stop = route_stops[i]
+#                 next_stop = route_stops[i + 1]
+#
+#                 # Utwórz unikalny identyfikator pary przystanków
+#                 stop_pair = (current_stop.uuid, next_stop.uuid)
+#                 reverse_pair = (next_stop.uuid, current_stop.uuid)
+#
+#                 # Sprawdź czy już nie przetwarzaliśmy tej pary (lub odwrotnej)
+#                 if stop_pair not in processed_pairs and reverse_pair not in processed_pairs:
+#                     processed_pairs.add(stop_pair)
+#
+#                     if random.random() < 0.15:  # 15% szans na opóźnienie
+#                         delay_minutes = random.randint(1, 8)  # 1-8 minut opóźnienia
+#
+#                         # Wybierz przyczynę (dla odcinków tras to głównie korki lub wypadki)
+#                         reason = random.choice([
+#                             DelayReason.TRAFFIC_JAM,
+#                             DelayReason.ROAD_ACCIDENT,
+#                             DelayReason.SEVERE_WEATHER
+#                         ])
+#
+#                         delay = Delay(
+#                             uuid=uuid.uuid4(),
+#                             time_delay=timedelta(minutes=delay_minutes),
+#                             reason=reason
+#                         )
+#
+#                         database_instance.stop_delays[(current_stop, next_stop)] = delay
+#                         print(
+#                             f"🛤️  Odcinek {current_stop.short_name} → {next_stop.short_name} ma opóźnienie {delay_minutes} min (przyczyna: {reason.name})")
+#
+#         # Dodaj kilka dodatkowych, większych opóźnień w kluczowych miejscach
+#         critical_delays = [
+#             ("Rondo Mogilskie", "Dworzec Główny Tunel", 15, DelayReason.TRAFFIC_JAM),
+#             ("Rondo Grunwaldzkie", "Wawel", 8, DelayReason.ROAD_ACCIDENT),
+#             ("Kampus UJ", "Norymberska", 6, DelayReason.TRAFFIC_JAM),
+#             ("Rondo Czyżyńskie", "Plac Centralny im. R. Reagana", 10, DelayReason.SEVERE_WEATHER)
+#         ]
+#
+#         for from_name, to_name, delay_min, reason in critical_delays:
+#             if random.random() < 0.4:  # 40% szans na krytyczne opóźnienie
+#                 from_stop = all_stops.get(from_name)
+#                 to_stop = all_stops.get(to_name)
+#
+#                 if from_stop and to_stop:
+#                     delay = Delay(
+#                         uuid=uuid.uuid4(),
+#                         time_delay=timedelta(minutes=delay_min),
+#                         reason=reason
+#                     )
+#
+#                     database_instance.stop_delays[(from_stop, to_stop)] = delay
+#                     print(f"⚠️  KRYTYCZNE OPÓŹNIENIE: {from_name} → {to_name}: +{delay_min} min ({reason.name})")
+#
+#     # --- 6. Złożenie finalnej bazy danych ---
+#     trips_dict = {trip.uuid: trip for trip in all_trips}
+#     vehicles_dict = {v.uuid: v for v in tram_vehicles + bus_vehicles}
+#     stops_dict = {s.uuid: s for s in all_stops.values()}
+#
+#     # Stworzenie obiektu bazy danych przy użyciu nowego konstruktora
+#     database = Database(
+#         users={},
+#         vehicles=vehicles_dict,
+#         stops=stops_dict,
+#         trips=trips_dict,
+#         stop_delays={},
+#         vehicle_delays={}
+#     )
+#
+#     # Dodaj losowe opóźnienia
+#     print("\n🎲 Generowanie losowych opóźnień...")
+#     print("=" * 50)
+#     add_random_delays(database)
+#     print("=" * 50)
+#     print(f"✅ Wygenerowano opóźnienia dla {len(database.vehicle_delays)} pojazdów")
+#     print(f"✅ Wygenerowano opóźnienia dla {len(database.stop_delays)} odcinków tras\n")
+#
+#     return database
+#
+#
+# # Globalna instancja bazy danych
+# db = create_krakow_database()
