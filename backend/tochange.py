@@ -114,17 +114,13 @@ def report_delay(data: ReportDelaySerializer):
 
     return {"success": True}
 
-@router.get("/api/v1")
-
 @router.get("/api/v1/plan_route", response_model=RouteResponse)
 def get_plan_route(
         start_lat: float,
         start_lon: float,
         end_lat: float,
         end_lon: float,
-        hour: int,
-        minute: int,
-        date: str = None  # Format: "YYYY-MM-DD", domyślnie dzisiaj
+        departure_timestamp: int  # Unix timestamp (sekundy od 1970-01-01)
 ):
     """
     Planuje optymalną trasę komunikacji publicznej między dwoma punktami.
@@ -134,9 +130,7 @@ def get_plan_route(
     - start_lon: Długość geograficzna punktu startowego (-180 do 180)
     - end_lat: Szerokość geograficzna punktu docelowego (-90 do 90)
     - end_lon: Długość geograficzna punktu docelowego (-180 do 180)
-    - hour: Godzina odjazdu (0-23)
-    - minute: Minuta odjazdu (0-59)
-    - date: Data w formacie YYYY-MM-DD (opcjonalnie, domyślnie dzisiaj)
+    - departure_timestamp: Unix timestamp określający czas odjazdu (sekundy od 1970-01-01)
 
     **Zwraca:**
     - Szczegółową trasę z Unix timestamps i informacjami o przystankach, pojazdach i opóźnieniach
@@ -149,30 +143,24 @@ def get_plan_route(
         if not (-90 <= end_lat <= 90) or not (-180 <= end_lon <= 180):
             raise HTTPException(status_code=400, detail="Nieprawidłowe współrzędne punktu docelowego")
 
-        if not (0 <= hour <= 23):
-            raise HTTPException(status_code=400, detail="Nieprawidłowa godzina (0-23)")
+        # Walidacja i konwersja timestamp
+        try:
+            departure_time = datetime.fromtimestamp(departure_timestamp)
+        except (ValueError, OverflowError, OSError):
+            raise HTTPException(status_code=400, detail="Nieprawidłowy timestamp odjazdu")
 
-        if not (0 <= minute <= 59):
-            raise HTTPException(status_code=400, detail="Nieprawidłowa minuta (0-59)")
-
-        # Utworzenie czasu odjazdu
-        if date:
-            try:
-                departure_date = datetime.strptime(date, "%Y-%m-%d").date()
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Nieprawidłowy format daty. Użyj: YYYY-MM-DD")
-        else:
-            departure_date = datetime.now().date()
-
-        departure_time = datetime.combine(departure_date, datetime.min.time()).replace(
-            hour=hour, minute=minute, second=0, microsecond=0
-        )
+        # Sprawdź czy timestamp nie jest zbyt stary lub zbyt daleko w przyszłości
+        now = datetime.now()
+        if departure_time < now - timedelta(days=1):
+            raise HTTPException(status_code=400, detail="Czas odjazdu nie może być starszy niż 1 dzień")
+        if departure_time > now + timedelta(days=365):
+            raise HTTPException(status_code=400, detail="Czas odjazdu nie może być dalszy niż 1 rok")
 
         # Informacje o żądaniu
         request_info = {
             "start_coordinates": {"latitude": start_lat, "longitude": start_lon},
             "end_coordinates": {"latitude": end_lat, "longitude": end_lon},
-            "departure_timestamp": int(departure_time.timestamp()),
+            "departure_timestamp": departure_timestamp,
             "processing_timestamp": int(datetime.now().timestamp())
         }
 
@@ -199,8 +187,8 @@ def get_plan_route(
                     total_wait_time_minutes=0,
                     total_delay_time_minutes=0,
                     number_of_transfers=0,
-                    departure_timestamp=int(departure_time.timestamp()),
-                    arrival_timestamp=int(departure_time.timestamp()),
+                    departure_timestamp=departure_timestamp,
+                    arrival_timestamp=departure_timestamp,
                     segments_count=0,
                     walking_segments_count=0,
                     transit_segments_count=0

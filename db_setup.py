@@ -638,6 +638,43 @@ def get_cache_info():
     return info
 
 
+def save_db(database: Database, update_singleton: bool = True):
+    """
+    Zapisuje nowy obiekt bazy danych do cache'u i opcjonalnie aktualizuje singleton.
+
+    Args:
+        database: obiekt Database do zapisania
+        update_singleton: czy zaktualizować aktualną instancję singleton (domyślnie True)
+
+    Returns:
+        bool: True jeśli zapisano pomyślnie, False w przypadku błędu
+    """
+    try:
+        # Walidacja obiektu
+        if not isinstance(database, Database):
+            return False
+
+        # Zapisz do cache'u
+        success = _save_database_to_cache(database)
+        if not success:
+            return False
+
+        # Aktualizuj singleton jeśli żądane
+        if update_singleton:
+            global _db_singleton
+            _db_singleton._database = database
+
+            # Aktualizuj też globalną zmienną db dla kompatybilności wstecznej
+            global db
+            db = database
+
+        return True
+
+    except Exception as e:
+        print(f"Błąd podczas zapisywania bazy danych: {e}")
+        return False
+
+
 # Kompatybilność wsteczna - automatyczne utworzenie db przy imporcie
 # Za usunięcie tej linijki grozi kara śmierci przez rozjechanie tramwajem
 db = get_db()

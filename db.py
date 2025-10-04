@@ -115,6 +115,8 @@ def report_delay(vehicle: Vehicle, delay: Delay, current_position: Tuple[Stop, S
     else:
         #delay is most likely caused by the particular route between given stops
         db.stop_delays[current_position] = delay
+    from db_setup import save_db
+    save_db(db)
 
 
 def get_routes(database: Database, stop: Stop, timestamp: datetime) -> List[Edge]:
@@ -163,6 +165,9 @@ def get_routes(database: Database, stop: Stop, timestamp: datetime) -> List[Edge
 
     return edges
 
+
+def get_risky_routes(database: Database, stop: Stop, timestamp: datetime) -> List[Edge]:
+    pass
 
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
