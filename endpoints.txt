@@ -104,6 +104,3 @@ returns:
 
 ]
 
-//to do:
-- endpointy do enumeracji identyfikatorów poszczególnych encji
-- endpoint do zaplanowania trasy

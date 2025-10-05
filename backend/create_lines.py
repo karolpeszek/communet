@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 
-api_key = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijc4NTRiZDc0MWUwNzQyNGI4NDJkYmYzMTRmYWFkMjc4IiwiaCI6Im11cm11cjY0In0="  # from ORS dashboard
+api_key = "..."  # from ORS dashboard
 #noted, thanks
 
 # Cache globalny dla tras (w pamięci)
@@ -252,7 +252,7 @@ def create_detailed_route_geometry(route_segments) -> List[Tuple[float, float]]:
     Używa cache'u dla optymalizacji.
 
     Args:
-        route_segments: Lista segmentów trasy z tochange.py
+        route_segments: Lista segmentów trasy z plan_route.py
 
     Returns:
         Lista wszystkich współrzędnych [(lat, lon), ...] całej trasy
@@ -336,42 +336,3 @@ def test_single_route():
     route_latlon = [(lat, lon) for lon, lat in coords]  # ORS gives [lon, lat]
 
     # print(route_latlon)
-
-
-if __name__ == "__main__":
-    # Załaduj cache przy starcie
-    _load_cache_from_file()
-
-    print("🧪 Test cache'owania tras")
-    print("=" * 50)
-
-    # Test 1: Pierwszego wywołania (powinno użyć API)
-    print("\n1️⃣ Pierwsze wywołanie (powinno użyć API):")
-    route1 = get_route_between_points((19.9372, 50.0614), (19.9368, 50.0544), "foot-walking")
-    print(f"Otrzymano {len(route1)} punktów")
-
-    # Test 2: Tego samego wywołania (powinno użyć cache'u)
-    print("\n2️⃣ To samo wywołanie (powinno użyć cache'u):")
-    route2 = get_route_between_points((19.9372, 50.0614), (19.9368, 50.0544), "foot-walking")
-    print(f"Otrzymano {len(route2)} punktów")
-
-    # Sprawdź czy to te same wyniki
-    if route1 == route2:
-        print("✅ Cache działa poprawnie - identyczne wyniki!")
-    else:
-        print("❌ Problem z cache'em - różne wyniki!")
-
-    # Test 3: Inny tryb transportu dla tych samych punktów
-    print("\n3️⃣ Inny tryb transportu (driving-car):")
-    route3 = get_route_between_points((19.9372, 50.0614), (19.9368, 50.0544), "driving-car")
-    print(f"Otrzymano {len(route3)} punktów")
-
-    # Statystyki cache'u
-    print("\n📊 Statystyki cache'u:")
-    stats = get_cache_stats()
-    for key, value in stats.items():
-        print(f"  {key}: {value}")
-
-    # Zapisz cache
-    _save_cache_to_file()
-    print("\n💾 Cache został zapisany do pliku")

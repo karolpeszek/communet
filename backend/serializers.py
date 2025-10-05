@@ -4,7 +4,7 @@ from typing import Tuple
 from pydantic import BaseModel
 
 class ReportDelaySerializer(BaseModel):
-    delay: int | None = 18000 #XD
+    delay: int | None = 18000 
     vehicle_uuid: str | None = "bff55c1e-9e3a-4a4f-b3a2-aabcca420494"
     current_stop_uuid: str
     next_stop_uuid: str

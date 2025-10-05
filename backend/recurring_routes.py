@@ -4,14 +4,14 @@ from typing import List, Optional
 from enum import Enum
 from datetime import datetime, time
 
-# Dodaj importy z algo i tochange
+# Dodaj importy z algo i plan_route
 import sys
 import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from algo import find_fastest_route
 from db_setup import db
-from backend.tochange import RouteResponse, RouteSegment, RouteSummary, StopInfo, VehicleInfo, DelayInfo
+from backend.plan_route import RouteResponse, RouteSegment, RouteSummary, StopInfo, VehicleInfo, DelayInfo
 from backend.create_lines import create_detailed_route_geometry
 
 router = APIRouter()
@@ -536,7 +536,7 @@ def calculate_recurring_route(route_id: str, use_now: bool = False):
                 ]
             )
 
-        # Konwertuj kroki trasy na format API (ta sama logika co w tochange.py)
+        # Konwertuj kroki trasy na format API (ta sama logika co w plan_route.py)
         route_segments = []
         total_walking_time = 0
         total_walking_distance = 0
