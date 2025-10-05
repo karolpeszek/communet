@@ -6,7 +6,7 @@ import json
 import os
 
 api_key = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijc4NTRiZDc0MWUwNzQyNGI4NDJkYmYzMTRmYWFkMjc4IiwiaCI6Im11cm11cjY0In0="  # from ORS dashboard
-#noted, thanks - jest darmowy anyway xdd
+#noted, thanks
 
 # Cache globalny dla tras (w pamięci)
 _route_cache: Dict[str, List[Tuple[float, float]]] = {}
