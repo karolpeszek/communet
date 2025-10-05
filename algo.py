@@ -63,11 +63,11 @@ def check_delays_for_segment(database: Database, vehicle_uuid: str, from_stop: S
         delay_source = f"odcinek {from_stop.short_name} → {to_stop.short_name}"
 
     if max_delay:
-        delay_minutes = max_delay.time_delay.total_seconds() / 60
+        delay_minutes = max_delay.time_delay / 60
         delay_info.update({
             'has_delay': True,
             'delay_minutes': delay_minutes,
-            'delay_reason': max_delay.reason.name,
+            'delay_reason': max_delay.reason,
             'delay_source': delay_source
         })
 

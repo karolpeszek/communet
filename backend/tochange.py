@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
+
 # Modele danych dla API
 class CoordinatePoint(BaseModel):
     latitude: float
@@ -105,12 +106,11 @@ class RouteResponse(BaseModel):
 
 @router.post("/api/v1/delay/report")
 def report_delay(data: ReportDelaySerializer):
-
     delay = Delay(uuid.UUID(data.vehicle_uuid), 500, data.delay_reason)
     vehicle = db.get_vehicle(uuid.UUID(data.vehicle_uuid))
     cur = db.get_stop(uuid.UUID(data.current_stop_uuid))
     next2 = db.get_stop(uuid.UUID(data.next_stop_uuid))
-    xd(vehicle, delay,(cur,next2))
+    xd(vehicle, delay, (cur, next2))
 
     return {"success": True}
 
@@ -120,7 +120,7 @@ def get_plan_route(
         start_lon: float,
         end_lat: float,
         end_lon: float,
-        departure_timestamp: int  # Unix timestamp (sekundy od 1970-01-01)
+        timestamp: int  # Unix timestamp w sekundach
 ):
     """
     Planuje optymalną trasę komunikacji publicznej między dwoma punktami.
@@ -130,10 +130,15 @@ def get_plan_route(
     - start_lon: Długość geograficzna punktu startowego (-180 do 180)
     - end_lat: Szerokość geograficzna punktu docelowego (-90 do 90)
     - end_lon: Długość geograficzna punktu docelowego (-180 do 180)
-    - departure_timestamp: Unix timestamp określający czas odjazdu (sekundy od 1970-01-01)
+    - timestamp: Unix timestamp w sekundach (czas odjazdu)
 
     **Zwraca:**
     - Szczegółową trasę z Unix timestamps i informacjami o przystankach, pojazdach i opóźnieniach
+
+    **Przykład:**
+    ```
+    GET /api/v1/plan_route?start_lat=50.063&start_lon=19.938&end_lat=50.067&end_lon=19.990&timestamp=1705320600
+    ```
     """
     try:
         # Walidacja parametrów
@@ -143,24 +148,17 @@ def get_plan_route(
         if not (-90 <= end_lat <= 90) or not (-180 <= end_lon <= 180):
             raise HTTPException(status_code=400, detail="Nieprawidłowe współrzędne punktu docelowego")
 
-        # Walidacja i konwersja timestamp
+        # Walidacja timestamp
         try:
-            departure_time = datetime.fromtimestamp(departure_timestamp)
-        except (ValueError, OverflowError, OSError):
-            raise HTTPException(status_code=400, detail="Nieprawidłowy timestamp odjazdu")
-
-        # Sprawdź czy timestamp nie jest zbyt stary lub zbyt daleko w przyszłości
-        now = datetime.now()
-        if departure_time < now - timedelta(days=1):
-            raise HTTPException(status_code=400, detail="Czas odjazdu nie może być starszy niż 1 dzień")
-        if departure_time > now + timedelta(days=365):
-            raise HTTPException(status_code=400, detail="Czas odjazdu nie może być dalszy niż 1 rok")
+            departure_time = datetime.fromtimestamp(timestamp)
+        except (ValueError, OSError, OverflowError):
+            raise HTTPException(status_code=400, detail="Nieprawidłowy timestamp")
 
         # Informacje o żądaniu
         request_info = {
             "start_coordinates": {"latitude": start_lat, "longitude": start_lon},
             "end_coordinates": {"latitude": end_lat, "longitude": end_lon},
-            "departure_timestamp": departure_timestamp,
+            "departure_timestamp": timestamp,
             "processing_timestamp": int(datetime.now().timestamp())
         }
 
@@ -187,8 +185,8 @@ def get_plan_route(
                     total_wait_time_minutes=0,
                     total_delay_time_minutes=0,
                     number_of_transfers=0,
-                    departure_timestamp=departure_timestamp,
-                    arrival_timestamp=departure_timestamp,
+                    departure_timestamp=timestamp,
+                    arrival_timestamp=timestamp,
                     segments_count=0,
                     walking_segments_count=0,
                     transit_segments_count=0

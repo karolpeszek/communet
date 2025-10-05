@@ -143,9 +143,9 @@ def get_routes(database: Database, stop: Stop, timestamp: datetime) -> List[Edge
 
         max_delay_seconds = 0
         if vehicle_delay is not None:
-            max_delay_seconds = max(max_delay_seconds, vehicle_delay.time_delay.total_seconds())
+            max_delay_seconds = max(max_delay_seconds, vehicle_delay.time_delay)
         if stop_delay is not None:
-            max_delay_seconds = max(max_delay_seconds, stop_delay.time_delay.total_seconds())
+            max_delay_seconds = max(max_delay_seconds, stop_delay.time_delay)
 
         # Calculate actual departure time from current stop
         departure_time = trip.timestamps[idx] + timedelta(seconds=max_delay_seconds)
